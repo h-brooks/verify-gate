@@ -29,6 +29,7 @@ fn custom_min_edits_allows_below_threshold() {
 
     Command::cargo_bin("verify-gate")
         .unwrap()
+        .env("HOME", &dir)
         .current_dir(&dir)
         .arg("check")
         .arg(fixture("two_edits_no_verification.jsonl"))
@@ -52,6 +53,7 @@ fn custom_ignore_paths_exempts_extra_extension() {
     // there are no qualifying edits left at all.
     Command::cargo_bin("verify-gate")
         .unwrap()
+        .env("HOME", &dir)
         .current_dir(&dir)
         .arg("check")
         .arg(fixture("edit_no_verification.jsonl"))
@@ -70,6 +72,7 @@ fn malformed_config_falls_back_to_defaults() {
     // Falls back to defaults, so the plain unverified-edit case still blocks.
     Command::cargo_bin("verify-gate")
         .unwrap()
+        .env("HOME", &dir)
         .current_dir(&dir)
         .arg("check")
         .arg(fixture("edit_no_verification.jsonl"))
@@ -79,6 +82,37 @@ fn malformed_config_falls_back_to_defaults() {
         .stderr(predicate::str::contains("failed to parse config"));
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn global_home_config_is_used_when_no_cwd_config_exists() {
+    // Exercises the `~/.config/verify-gate/config.toml` fallback directly
+    // (previously untested), and doubles as documentation for why every
+    // other test in this suite must pin HOME to an empty directory: a real
+    // config sitting at this path on the machine running `cargo test` would
+    // otherwise silently change every other test's result (min_edits = 99
+    // makes a single unverified edit allow instead of block).
+    let home = temp_dir("global-config-home");
+    let cwd = temp_dir("global-config-cwd"); // no .verify-gate.toml here
+    std::fs::create_dir_all(home.join(".config/verify-gate")).unwrap();
+    std::fs::write(
+        home.join(".config/verify-gate/config.toml"),
+        "min_edits = 99\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("verify-gate")
+        .unwrap()
+        .env("HOME", &home)
+        .current_dir(&cwd)
+        .arg("check")
+        .arg(fixture("edit_no_verification.jsonl"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("decision: allow"));
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&cwd).ok();
 }
 
 #[test]

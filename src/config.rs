@@ -34,7 +34,16 @@ impl Default for Config {
                 "NotebookEdit".to_string(),
             ],
             edit_command_patterns: vec![
-                r"\b(sed -i|tee |>{1,2} ?[^&]|cat >|git apply|patch )".to_string()
+                r"\bsed -i".to_string(),
+                r"\btee ".to_string(),
+                r"\bcat >".to_string(),
+                r"\bgit apply".to_string(),
+                r"\bpatch ".to_string(),
+                // A plain stdout/fd-1 redirect to a file: `> file` or `>> file`,
+                // requiring whitespace right before the `>` so this doesn't fire
+                // on `2>/dev/null` (digit immediately before `>`), and requiring
+                // a non-`&` target so `>&2`/`1>&2` duplications don't count.
+                r"(^|\s)1?>{1,2}\s*[^&\s]".to_string(),
             ],
             ignore_paths: vec![
                 "**/*.md".to_string(),
@@ -135,7 +144,14 @@ pub const INIT_TEMPLATE: &str = r#"# verify-gate configuration
 edit_tools = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
 
 # Bash commands matching any of these patterns also count as an edit.
-edit_command_patterns = ["\\b(sed -i|tee |>{1,2} ?[^&]|cat >|git apply|patch )"]
+edit_command_patterns = [
+    "\\bsed -i",
+    "\\btee ",
+    "\\bcat >",
+    "\\bgit apply",
+    "\\bpatch ",
+    "(^|\\s)1?>{1,2}\\s*[^&\\s]",
+]
 
 # Edits to paths matching any of these globs never require verification.
 ignore_paths = ["**/*.md", "**/.claude/**", "**/memory/**", "**/scratchpad/**"]

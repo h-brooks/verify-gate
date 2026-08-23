@@ -62,10 +62,12 @@ matching `edit_command_patterns`, excluding any target path that matches
   verification → **allow** (lets a single trivial edit through without
   nagging; raise `min_edits` to require more before the gate engages).
 - No **verification** call (a tool matching `verify_tools`, or a `Bash`
-  command matching `verify_patterns`) happened after that edit → **block**,
-  naming every file edited since the last verification.
-- The most recent verification after the edit came back with
-  `is_error: true` → **block**, quoting the first 200 characters of its
+  command matching `verify_patterns`) with a result that actually came back
+  happened after that edit → **block**, naming every file edited since the
+  last verification. A verification tool call with no matching result (e.g.
+  the user interrupted it) does not count.
+- Any verification after the edit came back with `is_error: true` →
+  **block**, quoting the first 200 characters of the most recent failing
   result.
 - Otherwise → **allow**.
 
@@ -96,6 +98,10 @@ translator, not a full glob spec — see below.
 
 ## What it can't catch
 
+- **Subagent (Task-delegated) edits.** Records with `isSidechain: true` are
+  skipped entirely (see "The rule" above), so an edit made by a subagent —
+  the normal way large or parallel edits get delegated — is invisible to the
+  gate even if the main session never verifies it afterwards.
 - **Any file path it can't find.** `Edit`/`Write`/`MultiEdit`/`NotebookEdit`
   are read from `file_path` / `path` / `notebook_path` in the tool input.
   For a `Bash` edit command, the edited file is guessed by picking the last

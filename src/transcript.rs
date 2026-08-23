@@ -20,6 +20,11 @@ pub struct VerifyEvent {
     pub tool_name: String,
     pub is_error: bool,
     pub result_snippet: String,
+    /// Whether a matching `tool_result` was ever seen for this verification's
+    /// `tool_use`. A verification whose result never arrives (the call was
+    /// interrupted, rejected, or simply never completed before the transcript
+    /// ends) must not count as a passing verification.
+    pub resolved: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,24 +58,45 @@ pub fn evaluate_transcript(path: &Path, config: &Config) -> Result<Report> {
 pub fn evaluate_reader<R: Read>(reader: BufReader<R>, config: &Config) -> Result<Report> {
     let edit_tool_set: std::collections::HashSet<&str> =
         config.edit_tools.iter().map(|s| s.as_str()).collect();
-    let edit_cmd_re =
-        RegexSet::new(&config.edit_command_patterns).context("compiling edit_command_patterns")?;
-    let verify_cmd_re =
-        RegexSet::new(&config.verify_patterns).context("compiling verify_patterns")?;
-    let verify_tool_re = RegexSet::new(&config.verify_tools).context("compiling verify_tools")?;
+    let edit_cmd_re = compile_pattern_set(
+        &config.edit_command_patterns,
+        "edit_command_patterns",
+        &Config::default().edit_command_patterns,
+    );
+    let verify_cmd_re = compile_pattern_set(
+        &config.verify_patterns,
+        "verify_patterns",
+        &Config::default().verify_patterns,
+    );
+    let verify_tool_re = compile_pattern_set(
+        &config.verify_tools,
+        "verify_tools",
+        &Config::default().verify_tools,
+    );
 
     let mut edits: Vec<EditEvent> = Vec::new();
     let mut verifies: Vec<VerifyEvent> = Vec::new();
     // tool_use_id -> index into `verifies`, so a later tool_result can fill in is_error.
     let mut pending_verify: HashMap<String, usize> = HashMap::new();
+    // Cap how many malformed-line warnings we print: a corrupt or truncated
+    // transcript can contain hundreds of thousands of bad lines, and printing
+    // one line per bad line can dump tens of MB into the harness's stderr pipe.
+    const MAX_MALFORMED_LINE_WARNINGS: usize = 20;
+    let mut malformed_lines = 0usize;
 
     for (idx, line_result) in reader.lines().enumerate() {
         let line_no = idx + 1;
         let line = match line_result {
             Ok(l) => l,
+            // A sticky I/O error (e.g. transcript_path is a directory, or a
+            // failing volume) makes every subsequent read fail the same way
+            // without ever consuming input, so `lines()` would never return
+            // `None` if we kept looping. Bail out instead: the caller
+            // (`hook`/`check`) already treats an `Err` here as an internal
+            // error and fails open, which is the correct outcome for an
+            // unreadable transcript.
             Err(e) => {
-                eprintln!("verify-gate: read error at line {line_no}: {e}");
-                continue;
+                return Err(e).context(format!("reading transcript at line {line_no}"));
             }
         };
         if line.trim().is_empty() {
@@ -79,7 +105,10 @@ pub fn evaluate_reader<R: Read>(reader: BufReader<R>, config: &Config) -> Result
         let record: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("verify-gate: skipping malformed line {line_no}: {e}");
+                malformed_lines += 1;
+                if malformed_lines <= MAX_MALFORMED_LINE_WARNINGS {
+                    eprintln!("verify-gate: skipping malformed line {line_no}: {e}");
+                }
                 continue;
             }
         };
@@ -151,6 +180,7 @@ pub fn evaluate_reader<R: Read>(reader: BufReader<R>, config: &Config) -> Result
                             tool_name: tool_name.clone(),
                             is_error: false,
                             result_snippet: String::new(),
+                            resolved: false,
                         });
                         if !tool_id.is_empty() {
                             pending_verify.insert(tool_id, idx);
@@ -174,6 +204,7 @@ pub fn evaluate_reader<R: Read>(reader: BufReader<R>, config: &Config) -> Result
                             .unwrap_or(false);
                         verifies[idx].is_error = is_error;
                         verifies[idx].result_snippet = result_snippet(block.get("content"));
+                        verifies[idx].resolved = true;
                     }
                 }
             }
@@ -181,7 +212,31 @@ pub fn evaluate_reader<R: Read>(reader: BufReader<R>, config: &Config) -> Result
         }
     }
 
+    if malformed_lines > MAX_MALFORMED_LINE_WARNINGS {
+        eprintln!(
+            "verify-gate: ...and {} more malformed lines skipped (warnings capped at {MAX_MALFORMED_LINE_WARNINGS})",
+            malformed_lines - MAX_MALFORMED_LINE_WARNINGS
+        );
+    }
+
     Ok(decide(edits, verifies, config))
+}
+
+/// Compiles a config-supplied pattern list, falling back to the built-in
+/// default for that field (with a stderr warning) if the user's patterns
+/// don't compile as regexes — consistent with how a malformed config file as
+/// a whole already falls back to defaults, rather than treating a single bad
+/// regex as a hard internal error.
+fn compile_pattern_set(patterns: &[String], field_name: &str, fallback: &[String]) -> RegexSet {
+    match RegexSet::new(patterns) {
+        Ok(re) => re,
+        Err(e) => {
+            eprintln!(
+                "verify-gate: invalid {field_name} ({e}), using the built-in default for this field"
+            );
+            RegexSet::new(fallback).expect("built-in default patterns must always compile")
+        }
+    }
 }
 
 fn decide(edits: Vec<EditEvent>, verifies: Vec<VerifyEvent>, config: &Config) -> Report {
@@ -194,9 +249,12 @@ fn decide(edits: Vec<EditEvent>, verifies: Vec<VerifyEvent>, config: &Config) ->
         };
     };
 
+    // Only a verification whose tool_result actually arrived counts: a
+    // tool_use with no result (interrupted, rejected, or never completed)
+    // is not evidence anything was checked.
     let verifies_after: Vec<VerifyEvent> = verifies
         .iter()
-        .filter(|v| v.line > last_edit.line)
+        .filter(|v| v.line > last_edit.line && v.resolved)
         .cloned()
         .collect();
 
@@ -222,10 +280,14 @@ fn decide(edits: Vec<EditEvent>, verifies: Vec<VerifyEvent>, config: &Config) ->
         let decision = if count < config.min_edits {
             Decision::Allow
         } else {
+            let file_list = if files.is_empty() {
+                "an unnamed file".to_string()
+            } else {
+                files.join(", ")
+            };
             Decision::Block {
                 reason: format!(
-                    "Edited without verification: {}. run the tests/build or verify the behaviour live; if verification is genuinely impossible, say so explicitly in your final message.",
-                    files.join(", ")
+                    "Edited without verification: {file_list}. run the tests/build or verify the behaviour live; if verification is genuinely impossible, say so explicitly in your final message."
                 ),
             }
         };
@@ -237,10 +299,14 @@ fn decide(edits: Vec<EditEvent>, verifies: Vec<VerifyEvent>, config: &Config) ->
             decision,
         }
     } else {
-        let latest = verifies_after.last().unwrap();
-        let decision = if latest.is_error {
+        // Block if ANY verification after the last edit failed, not just the
+        // one with the highest tool_use line: tool calls can be dispatched
+        // out of order relative to when their results come back, so "last by
+        // tool_use line" can pick a result that isn't actually the most
+        // recent thing that happened, and silently hide an earlier failure.
+        let decision = if let Some(failed) = verifies_after.iter().rev().find(|v| v.is_error) {
             Decision::Block {
-                reason: format!("last verification failed: {}", latest.result_snippet),
+                reason: format!("last verification failed: {}", failed.result_snippet),
             }
         } else {
             Decision::Allow
@@ -268,7 +334,12 @@ fn extract_bash_file_hint(command: &str) -> Option<String> {
     command
         .split_whitespace()
         .rev()
-        .find(|tok| !tok.starts_with('-') && (tok.contains('/') || tok.contains('.')))
+        .find(|tok| {
+            !tok.starts_with('-')
+                && !tok.contains('>')
+                && !tok.contains('<')
+                && (tok.contains('/') || tok.contains('.'))
+        })
         .map(|s| s.trim_matches(|c| c == '"' || c == '\'').to_string())
 }
 
@@ -305,4 +376,47 @@ fn result_snippet(content: Option<&Value>) -> String {
         None => String::new(),
     };
     text.chars().take(200).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_bash_file_hint_finds_sed_target() {
+        assert_eq!(
+            extract_bash_file_hint("sed -i s/a/b/ src/x.rs"),
+            Some("src/x.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_bash_file_hint_finds_plain_redirect_target() {
+        assert_eq!(
+            extract_bash_file_hint("echo fn main(){} > src/main.rs"),
+            Some("src/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_bash_file_hint_ignores_trailing_stderr_redirect() {
+        // A trailing `2>/dev/null` must never be picked as the "file", even
+        // when it's the last path-looking token in the command.
+        assert_eq!(
+            extract_bash_file_hint("sed -i s/a/b/ file.txt 2>/dev/null"),
+            Some("file.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_bash_file_hint_none_when_nothing_path_like() {
+        assert_eq!(extract_bash_file_hint("ls -la"), None);
+    }
+
+    #[test]
+    fn bash_label_truncates_and_prefixes() {
+        let long = "x".repeat(100);
+        let label = bash_label(&long);
+        assert_eq!(label, format!("$ {}", "x".repeat(60)));
+    }
 }
