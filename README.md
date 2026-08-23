@@ -1,5 +1,7 @@
 # verify-gate
 
+[![CI](https://github.com/h-brooks/verify-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/h-brooks/verify-gate/actions/workflows/ci.yml)
+
 A Claude Code `Stop` hook that refuses to let an agent end its turn after
 editing files without running anything to check the edit. It reads the
 harness's own transcript, so it works regardless of whether the agent

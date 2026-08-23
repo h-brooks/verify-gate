@@ -2,6 +2,11 @@
 name = "verify-gate"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Claude Code Stop hook that blocks done-claims when files were edited but nothing was verified afterwards"
+repository = "https://github.com/h-brooks/verify-gate"
+keywords = ["claude-code", "hooks", "agents", "verification", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "verify-gate"
