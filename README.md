@@ -37,23 +37,23 @@ Add this to `.claude/settings.json` (project or user level):
 
 ## Commands
 
-- `verify-gate hook` — reads the Stop-hook JSON payload from stdin, applies
+- `verify-gate hook`: reads the Stop-hook JSON payload from stdin, applies
   the rule below, and (only when it blocks) prints
   `{"decision":"block","reason":"..."}` to stdout. Always exits `0`; the
   block signal is the JSON, not the exit code, per the Stop hook contract.
   `--dry-run`, or the `VERIFY_GATE_DISABLE=1` environment variable, skips
   the rule and always allows (and says so on stderr).
-- `verify-gate check <transcript.jsonl> [--format text|json]` — runs the
+- `verify-gate check <transcript.jsonl> [--format text|json]`: runs the
   same rule directly over a saved transcript file. This is the test seam,
   and it's also useful for replaying the rule over recorded transcripts in
   CI. Exits `1` if the rule would block, `0` otherwise.
-- `verify-gate init` — writes `.verify-gate.toml` with the built-in
+- `verify-gate init`: writes `.verify-gate.toml` with the built-in
   defaults spelled out (never overwrites an existing file) and prints the
   settings.json snippet above.
 
 ## The rule
 
-Scan the transcript (main-session records only — anything with
+Scan the transcript (main-session records only; anything with
 `isSidechain: true` belongs to a subagent and is ignored) for the last
 qualifying **edit**: a call to a tool in `edit_tools`, or a `Bash` command
 matching `edit_command_patterns`, excluding any target path that matches
@@ -74,7 +74,7 @@ matching `edit_command_patterns`, excluding any target path that matches
 - Otherwise → **allow**.
 
 `stop_hook_active: true` in the hook payload always allows, regardless of
-the above — the agent is already mid-retry from a previous block, and
+the above: the agent is already mid-retry from a previous block, and
 blocking again would loop forever.
 
 ## Config reference (`.verify-gate.toml`)
@@ -96,22 +96,22 @@ than crashing the hook.
 | `min_edits` | `1` | Qualifying edits that must have piled up since the last verification before the gate blocks. |
 
 The glob matcher for `ignore_paths` is a small hand-rolled `*`/`**`
-translator, not a full glob spec — see below.
+translator, not a full glob spec; see below.
 
 ## What it can't catch
 
 - **Subagent (Task-delegated) edits.** Records with `isSidechain: true` are
-  skipped entirely (see "The rule" above), so an edit made by a subagent —
-  the normal way large or parallel edits get delegated — is invisible to the
+  skipped entirely (see "The rule" above), so an edit made by a subagent
+  (the normal way large or parallel edits get delegated) is invisible to the
   gate even if the main session never verifies it afterwards.
 - **Any file path it can't find.** `Edit`/`Write`/`MultiEdit`/`NotebookEdit`
   are read from `file_path` / `path` / `notebook_path` in the tool input.
   For a `Bash` edit command, the edited file is guessed by picking the last
-  path-looking token in the command — this is a heuristic and can point at
+  path-looking token in the command. This is a heuristic and can point at
   the wrong argument or none at all (in which case the whole command is
   reported as the "file" and `ignore_paths` can't apply to it).
 - **Verification of the wrong thing.** Running `cargo test` after editing
-  an unrelated file still counts as verification — the rule only checks
+  an unrelated file still counts as verification: the rule only checks
   *ordering* (a verification call happened after the edit), not that the
   verification actually exercised the edited code.
 - **Verification outside the transcript.** A human running the app
