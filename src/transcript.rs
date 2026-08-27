@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::glob::glob_matches;
 use anyhow::{Context, Result};
-use regex::RegexSet;
+use regex::{Regex, RegexSet};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
@@ -151,9 +151,14 @@ pub fn evaluate_reader<R: Read>(reader: BufReader<R>, config: &Config) -> Result
 
                     if tool_name == "Bash" {
                         let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                        if edit_cmd_re.is_match(command) {
+                        // Edit detection runs on the shell-SYNTAX view: quoted spans are data
+                        // handed to a program, not shell syntax, so an awk comparison ('$1 >= 3')
+                        // or a jq filter must not read as a redirect; likewise `> /dev/null`
+                        // discards output rather than editing a file.
+                        let syntax = shell_syntax_view(command);
+                        if edit_cmd_re.is_match(&syntax) {
                             is_edit = true;
-                            files = extract_bash_file_hint(command)
+                            files = extract_bash_file_hint(&syntax)
                                 .map(|f| vec![f])
                                 .unwrap_or_else(|| vec![bash_label(command)]);
                         }
@@ -330,6 +335,42 @@ fn extract_files(input: &Value) -> Vec<String> {
     files
 }
 
+/// Shell-syntax view of a command: quoted spans collapse to a single space and
+/// backslash-escaped characters are dropped, because that text is data handed to
+/// a program, not shell syntax — an awk program like `'$1 >= 3'` or a jq filter
+/// like `'.tag_name'` must never read as a redirect. Redirects whose target is a
+/// `/dev/` sink are also dropped: `> /dev/null` discards output, it edits nothing.
+fn shell_syntax_view(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut chars = command.chars();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                out.push(' ');
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                out.push(' ');
+            }
+            // Backslash escapes the next char (single quotes excepted, where it
+            // is literal data and the arm below drops it anyway).
+            '\\' if !in_single => {
+                chars.next();
+                out.push(' ');
+            }
+            _ if in_single || in_double => {}
+            _ => out.push(c),
+        }
+    }
+    static DEV_SINK: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let dev_sink = DEV_SINK
+        .get_or_init(|| Regex::new(r"[0-9]*>{1,2}\s*/dev/\w+").expect("static regex compiles"));
+    dev_sink.replace_all(&out, " ").into_owned()
+}
+
 fn extract_bash_file_hint(command: &str) -> Option<String> {
     command
         .split_whitespace()
@@ -418,5 +459,57 @@ mod tests {
         let long = "x".repeat(100);
         let label = bash_label(&long);
         assert_eq!(label, format!("$ {}", "x".repeat(60)));
+    }
+
+    fn default_edit_re() -> RegexSet {
+        compile_pattern_set(
+            &Config::default().edit_command_patterns,
+            "edit_command_patterns",
+            &Config::default().edit_command_patterns,
+        )
+    }
+
+    #[test]
+    fn quoted_awk_comparison_is_not_an_edit() {
+        // `>=` inside a single-quoted awk program is data, not a redirect.
+        let cmd = "for f in $(ls dir | awk -F_ '$1 >= 20260617'); do echo dir/$f; done";
+        assert!(!default_edit_re().is_match(&shell_syntax_view(cmd)));
+    }
+
+    #[test]
+    fn quoted_jq_filter_is_not_an_edit() {
+        let cmd = r#"gh api repos/o/r/releases --jq '.tag_name + " " + .published_at' 2>/dev/null"#;
+        assert!(!default_edit_re().is_match(&shell_syntax_view(cmd)));
+    }
+
+    #[test]
+    fn dev_null_redirect_is_not_an_edit() {
+        let cmd = "npx tool check config.yml > /dev/null 2>&1 && echo ok";
+        assert!(!default_edit_re().is_match(&shell_syntax_view(cmd)));
+    }
+
+    #[test]
+    fn real_redirect_still_detected_through_view() {
+        let cmd = "echo hello > out.txt";
+        assert!(default_edit_re().is_match(&shell_syntax_view(cmd)));
+    }
+
+    #[test]
+    fn sed_in_place_still_detected_through_view() {
+        let cmd = "sed -i s/a/b/ src/x.rs";
+        assert!(default_edit_re().is_match(&shell_syntax_view(cmd)));
+    }
+
+    #[test]
+    fn quoted_mention_of_sed_is_not_an_edit() {
+        let cmd = "echo 'use sed -i for that'";
+        assert!(!default_edit_re().is_match(&shell_syntax_view(cmd)));
+    }
+
+    #[test]
+    fn view_survives_escaped_quotes_inside_double_quotes() {
+        // The escaped quote must not end the span and leak `>` as syntax.
+        let cmd = r#"grep "a \" b > c" file.txt"#;
+        assert!(!default_edit_re().is_match(&shell_syntax_view(cmd)));
     }
 }
