@@ -58,11 +58,11 @@ impl Default for Config {
                 r"pytest".to_string(),
                 r"python -m (pytest|unittest)".to_string(),
                 r"go (test|build)".to_string(),
-                r"make( test| check)?".to_string(),
+                r"\bmake\b( test| check)?".to_string(),
                 r"curl ".to_string(),
-                r"http ".to_string(),
+                r"\bhttp ".to_string(),
                 r"playwright".to_string(),
-                r"tsc".to_string(),
+                r"\btsc\b".to_string(),
                 r"eslint".to_string(),
                 r"ruff".to_string(),
                 r"mypy".to_string(),
@@ -164,11 +164,11 @@ verify_patterns = [
     "pytest",
     "python -m (pytest|unittest)",
     "go (test|build)",
-    "make( test| check)?",
+    "\\bmake\\b( test| check)?",
     "curl ",
-    "http ",
+    "\\bhttp ",
     "playwright",
-    "tsc",
+    "\\btsc\\b",
     "eslint",
     "ruff",
     "mypy",
@@ -192,5 +192,36 @@ mod tests {
         let partial: PartialConfig = toml::from_str(INIT_TEMPLATE).expect("template parses");
         let from_template = Config::default().merge(partial);
         assert_eq!(from_template, Config::default());
+    }
+
+    fn verify_re() -> regex::RegexSet {
+        regex::RegexSet::new(&Config::default().verify_patterns).expect("default patterns compile")
+    }
+
+    #[test]
+    fn bare_tsc_pattern_does_not_match_inside_a_filename() {
+        // "tsc" is a literal substring of "tsconfig.json"; just reading that
+        // file is not running the TypeScript compiler.
+        let cmd = "cat tsconfig.json";
+        assert!(!verify_re().is_match(cmd));
+    }
+
+    #[test]
+    fn tsc_still_matches_a_standalone_invocation() {
+        let cmd = "tsc --noEmit";
+        assert!(verify_re().is_match(cmd));
+    }
+
+    #[test]
+    fn bare_make_pattern_does_not_match_makefile_ish_prose() {
+        let cmd = "echo 'update the Makefile to remake the docs bundle'";
+        assert!(!verify_re().is_match(cmd));
+    }
+
+    #[test]
+    fn make_still_matches_plain_and_test_and_check_invocations() {
+        assert!(verify_re().is_match("make"));
+        assert!(verify_re().is_match("make test"));
+        assert!(verify_re().is_match("make check"));
     }
 }
