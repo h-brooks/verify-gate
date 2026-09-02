@@ -128,19 +128,18 @@ fn readonly_grep_with_stderr_redirect_after_verified_edit_allows() {
 }
 
 #[test]
-fn interleaved_verification_results_blocks_on_any_failure_after_edit() {
+fn interleaved_verification_results_latest_green_wins() {
     // The failing `cargo test` tool_use is issued before the passing `curl`
-    // tool_use, but its result arrives after. Picking "verification with the
-    // highest tool_use line" would wrongly report the passing curl as the
-    // last word and allow; the rule must block if ANY verification after the
-    // edit failed.
+    // tool_use, with results crossed. Latest-wins semantics: the newest
+    // dispatched verification (the passing curl) decides, so this allows.
+    // The old rule blocked on ANY failure after the edit, which made a
+    // single benign failure unclearable: no number of later green runs could
+    // lift the block until the next edit. Same-line ties (parallel calls in
+    // one assistant message) still block conservatively on any failure --
+    // that path is covered by unit tests on `decide`.
     check("interleaved_verification_failure_after_success_blocks.jsonl")
-        .failure()
-        .code(1)
-        .stdout(
-            predicate::str::contains("decision: block")
-                .and(predicate::str::contains("last verification failed")),
-        );
+        .success()
+        .stdout(predicate::str::contains("decision: allow"));
 }
 
 #[test]

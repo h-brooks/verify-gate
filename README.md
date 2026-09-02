@@ -65,13 +65,25 @@ matching `edit_command_patterns`, excluding any target path that matches
   nagging; raise `min_edits` to require more before the gate engages).
 - No **verification** call (a tool matching `verify_tools`, or a `Bash`
   command matching `verify_patterns`) with a result that actually came back
-  happened after that edit → **block**, naming every file edited since the
-  last verification. A verification tool call with no matching result (e.g.
-  the user interrupted it) does not count.
-- Any verification after the edit came back with `is_error: true` →
-  **block**, quoting the first 200 characters of the most recent failing
-  result.
+  happened after (or in the same call as) that edit → **block**, naming
+  every file edited since the last verification. A verification tool call
+  with no matching result (the user interrupted it), or whose result matches
+  `denial_patterns` (the harness denied permission, so nothing ran), does
+  not count in either direction.
+- The **newest** verification after the edit came back with
+  `is_error: true` → **block**, quoting the first 200 characters of its
+  failing result. Only the latest verification decides: a benign failure
+  followed by a passing re-check does not keep blocking. Verifications
+  dispatched together in a single assistant message count as one moment,
+  and a failure among them still blocks.
 - Otherwise → **allow**.
+
+A `Bash` command that edits and verifies in one call (`printf '%s' "$q" >
+query.json && curl -d @query.json ...`) counts as verified by its own
+result. A relative redirect target after a `cd` in the same command
+resolves under that directory before `ignore_paths` is consulted, so
+`cd /tmp/scratch && printf > out.json` is judged by where the file really
+lands.
 
 `stop_hook_active: true` in the hook payload always allows, regardless of
 the above: the agent is already mid-retry from a previous block, and
@@ -93,6 +105,7 @@ than crashing the hook.
 | `ignore_paths` | `**/*.md`, `**/.claude/**`, `**/memory/**`, `**/scratchpad/**` | Globs; edits to a matching path never require verification. |
 | `verify_patterns` | `cargo test/build/...`, `npm/pnpm/yarn/bun test/run`, `pytest`, `go test`, `make`, `curl `, `playwright`, `tsc`, `eslint`, `ruff`, `mypy`, `screenshot`, ... | Regexes; a matching `Bash` command counts as verification. |
 | `verify_tools` | `^mcp__(playwright\|claude-in-chrome)` | Regexes on tool name; a match counts as verification (browser-automation MCP tools). |
+| `denial_patterns` | `Permission for this action was denied`, `The user doesn't want to proceed`, `User rejected` | Regexes; a tool result matching one is treated as if the call never ran (a permission denial is not a verification outcome). |
 | `min_edits` | `1` | Qualifying edits that must have piled up since the last verification before the gate blocks. |
 
 The glob matcher for `ignore_paths` is a small hand-rolled `*`/`**`
