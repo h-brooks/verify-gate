@@ -151,11 +151,14 @@ pub fn evaluate_reader<R: Read>(reader: BufReader<R>, config: &Config) -> Result
 
                     if tool_name == "Bash" {
                         let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                        // Edit detection runs on the shell-SYNTAX view: quoted spans are data
-                        // handed to a program, not shell syntax, so an awk comparison ('$1 >= 3')
-                        // or a jq filter must not read as a redirect; likewise `> /dev/null`
-                        // discards output rather than editing a file.
-                        let syntax = shell_syntax_view(command);
+                        // Edit detection runs on the shell-SYNTAX view of the command with
+                        // heredoc bodies stripped first: a heredoc body is data written to a
+                        // file or piped to a program, not shell syntax, so its contents must
+                        // never be scanned for redirect operators or path-like tokens. Quoted
+                        // spans are data too (an awk comparison `'$1 >= 3'` or a jq filter must
+                        // not read as a redirect), and `> /dev/null` discards output rather than
+                        // editing a file.
+                        let syntax = shell_syntax_view(&strip_heredoc_bodies(command));
                         if edit_cmd_re.is_match(&syntax) {
                             is_edit = true;
                             files = extract_bash_file_hint(&syntax)
@@ -371,8 +374,113 @@ fn shell_syntax_view(command: &str) -> String {
     dev_sink.replace_all(&out, " ").into_owned()
 }
 
-fn extract_bash_file_hint(command: &str) -> Option<String> {
-    command
+/// Strips heredoc bodies (`<<EOF`, `<<'EOF'`, `<<"EOF"`, `<<-EOF`, ...) out of a
+/// Bash command, because a heredoc body is data written to a file or piped to
+/// a program, not shell syntax: it must never be scanned for redirect
+/// operators or path-like tokens by the edit-detection code below. The line
+/// that opens the heredoc is kept (it carries the real redirect, e.g.
+/// `cat > file.py <<'EOF'`); every line up to and including the terminator
+/// line is dropped.
+fn strip_heredoc_bodies(command: &str) -> String {
+    static HEREDOC_START: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let heredoc_start = HEREDOC_START.get_or_init(|| {
+        // No backreference to the opening quote (the `regex` crate doesn't
+        // support them): a mismatched quote around the tag is not something
+        // real shell input produces, so it's fine to just take the tag name.
+        Regex::new(r#"<<(-)?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)"#).expect("static regex compiles")
+    });
+
+    let lines: Vec<&str> = command.split('\n').collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        out.push(line);
+        i += 1;
+        let Some(caps) = heredoc_start.captures(line) else {
+            continue;
+        };
+        let strip_tabs = caps.get(1).is_some(); // `<<-` allows leading tabs on the terminator
+        let tag = caps.get(2).unwrap().as_str();
+        while i < lines.len() {
+            let body_line = lines[i];
+            i += 1;
+            let compare = if strip_tabs {
+                body_line.trim_start_matches('\t')
+            } else {
+                body_line
+            };
+            if compare == tag {
+                break; // terminator line consumed and dropped, not shell syntax either
+            }
+            // body line dropped: heredoc bodies are data, not shell syntax
+        }
+    }
+    out.join("\n")
+}
+
+/// Commands that unambiguously edit a file without a `>`/`>>` redirect
+/// operator to key off (their target is a plain argument instead).
+fn edit_keyword_re() -> &'static Regex {
+    static EDIT_KEYWORD: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    EDIT_KEYWORD.get_or_init(|| {
+        Regex::new(r"\bsed -i|\btee\b|\bgit apply\b|\bpatch\b").expect("static regex compiles")
+    })
+}
+
+/// Matches a `>`/`>>` redirect operator that writes to fd 1 (or explicit
+/// `1>`), the same operator shape `edit_command_patterns`'s default treats as
+/// an edit: `2>`, `3>`, etc. are excluded (their digit sits where `(^|\s)`
+/// needs to match). `>&`-style fd duplications are excluded separately by
+/// `redirect_matches` below, since the `regex` crate has no lookahead.
+fn redirect_op_re() -> &'static Regex {
+    static REDIRECT_OP: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    REDIRECT_OP.get_or_init(|| Regex::new(r"(?:^|\s)1?>{1,2}").expect("static regex compiles"))
+}
+
+fn split_command_segments(command: &str) -> Vec<&str> {
+    static SEGMENT_SPLIT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = SEGMENT_SPLIT
+        .get_or_init(|| Regex::new(r"&&|\|\||;|\n|\|").expect("static regex compiles"));
+    re.split(command).collect()
+}
+
+/// Redirect-operator matches in `segment`, excluding `>&`-style fd
+/// duplications (`>&2`, `1>&2`): those don't write to a file at all.
+fn redirect_matches(segment: &str) -> impl Iterator<Item = regex::Match<'_>> {
+    redirect_op_re()
+        .find_iter(segment)
+        .filter(|m| !segment[m.end()..].starts_with('&'))
+}
+
+/// The first `>`/`>>` target in `segment` that isn't a `/dev/` sink or an fd
+/// duplication. Returns `None` both when there's no redirect operator at
+/// all, and when every redirect operator present only targets a sink -- the
+/// two cases are told apart by the caller via `redirect_matches`.
+fn redirect_target_in_segment(segment: &str) -> Option<String> {
+    for m in redirect_matches(segment) {
+        let rest = segment[m.end()..].trim_start();
+        let Some(raw_target) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let target = raw_target.trim_matches(|c| c == '"' || c == '\'');
+        if target.is_empty() {
+            continue;
+        }
+        if target == "/dev/null" || target.starts_with("/dev/") {
+            continue;
+        }
+        return Some(target.to_string());
+    }
+    None
+}
+
+/// Last non-flag, path-like token in `segment`, ignoring anything that itself
+/// contains a redirect operator. This is the fallback used only for commands
+/// (`sed -i`, `tee`, `git apply`, `patch`) whose file target is a plain
+/// argument rather than a `>`/`>>` redirect target.
+fn last_path_like_token(segment: &str) -> Option<String> {
+    segment
         .split_whitespace()
         .rev()
         .find(|tok| {
@@ -382,6 +490,32 @@ fn extract_bash_file_hint(command: &str) -> Option<String> {
                 && (tok.contains('/') || tok.contains('.'))
         })
         .map(|s| s.trim_matches(|c| c == '"' || c == '\'').to_string())
+}
+
+/// Finds the file a Bash edit command targets, scoped to the command segment
+/// (split on `&&`, `||`, `;`, `|`, and newlines) that actually performs the
+/// edit, rather than the last path-like token anywhere in the whole command:
+/// a later, unrelated segment in the same compound command must never
+/// override the real target.
+fn extract_bash_file_hint(command: &str) -> Option<String> {
+    for segment in split_command_segments(command) {
+        if let Some(target) = redirect_target_in_segment(segment) {
+            return Some(target);
+        }
+        if redirect_matches(segment).next().is_some() {
+            // A redirect operator is present but every target it points at
+            // is a sink or fd duplication: this segment is conclusively not
+            // an edit, so don't fall through to the generic token scan below
+            // and risk picking up an unrelated argument as a false hint.
+            continue;
+        }
+        if edit_keyword_re().is_match(segment) {
+            if let Some(target) = last_path_like_token(segment) {
+                return Some(target);
+            }
+        }
+    }
+    None
 }
 
 fn bash_label(command: &str) -> String {
@@ -511,5 +645,76 @@ mod tests {
         // The escaped quote must not end the span and leak `>` as syntax.
         let cmd = r#"grep "a \" b > c" file.txt"#;
         assert!(!default_edit_re().is_match(&shell_syntax_view(cmd)));
+    }
+
+    /// Mirrors exactly what `evaluate_reader` does to a Bash command before
+    /// hint extraction: strip heredoc bodies, then take the shell-syntax view.
+    fn hint_via_pipeline(cmd: &str) -> Option<String> {
+        extract_bash_file_hint(&shell_syntax_view(&strip_heredoc_bodies(cmd)))
+    }
+
+    #[test]
+    fn heredoc_write_hint_ignores_body_text_uses_redirect_target() {
+        // The heredoc body is data, not shell syntax; the hint must come from
+        // the `>` target on the launching line, not from anything inside the
+        // body or from a later, unrelated command.
+        let cmd = "cat > scratch/build.py <<'EOF'\nsee /docs/api); note\nEOF\npython3 scratch/build.py";
+        assert_eq!(hint_via_pipeline(cmd), Some("scratch/build.py".to_string()));
+    }
+
+    #[test]
+    fn heredoc_write_hint_ignores_trailing_chained_commands() {
+        // A heredoc-terminator line followed by further chained commands
+        // (here ending in a piped `grep`) must not steal the hint away from
+        // the original redirect target.
+        let cmd = "cat > scratch/build.py <<'PYEOF'\nsee /docs/api); note\nPYEOF\npython3 scratch/build.py && true; grep -n \"x\" styles/components.css | head";
+        assert_eq!(hint_via_pipeline(cmd), Some("scratch/build.py".to_string()));
+    }
+
+    #[test]
+    fn redirect_to_dev_null_with_no_other_target_is_not_an_edit() {
+        // `>/dev/null` discards output; a trailing read-only command in the
+        // same compound command must not be mistaken for an edit either.
+        let cmd = "qlmanage -t -s 1400 -o scratch/render input.svg >/dev/null 2>&1; ls scratch/render";
+        let syntax = shell_syntax_view(&strip_heredoc_bodies(cmd));
+        assert!(!default_edit_re().is_match(&syntax));
+    }
+
+    #[test]
+    fn redirect_hint_scoped_to_segment_before_a_later_heredoc() {
+        // The real edit is the `>` redirect in the first `&&`-segment; a
+        // heredoc later in the same compound command (and the cleanup
+        // commands after it) must not override that hint.
+        let cmd = "sed -e 's/a/b/' input.txt > output.txt && python3 - <<'EOF'\nsee /docs/api); note\nEOF\nrm -f input.txt; ls -la /tmp/files*";
+        assert_eq!(hint_via_pipeline(cmd), Some("output.txt".to_string()));
+    }
+
+    #[test]
+    fn heredoc_write_target_under_ignored_path_produces_no_edit_event() {
+        // Regression guard for the false-positive this fix closes: once the
+        // hint correctly resolves to the redirect target, an ignored-path
+        // target (e.g. under scratchpad/) must suppress the edit entirely,
+        // exactly like a non-Bash edit tool would.
+        let command = "cat > scratchpad/build.py <<'EOF'\nsee /docs/api); note\nEOF";
+        let transcript = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "assistant",
+                "isSidechain": false,
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Bash",
+                        "input": {"command": command}
+                    }]
+                }
+            })
+        );
+        let reader = BufReader::new(std::io::Cursor::new(transcript.into_bytes()));
+        let report = evaluate_reader(reader, &Config::default()).expect("evaluates cleanly");
+        assert_eq!(report.decision, Decision::Allow);
+        assert!(report.last_edit.is_none());
     }
 }
