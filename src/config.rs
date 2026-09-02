@@ -10,6 +10,10 @@ pub struct Config {
     pub ignore_paths: Vec<String>,
     pub verify_patterns: Vec<String>,
     pub verify_tools: Vec<String>,
+    /// Tool results matching any of these patterns are treated as if the call
+    /// never ran: a permission denial is not a verification outcome, so it
+    /// must neither pass nor fail the gate.
+    pub denial_patterns: Vec<String>,
     pub min_edits: usize,
 }
 
@@ -21,6 +25,7 @@ struct PartialConfig {
     ignore_paths: Option<Vec<String>>,
     verify_patterns: Option<Vec<String>>,
     verify_tools: Option<Vec<String>>,
+    denial_patterns: Option<Vec<String>>,
     min_edits: Option<usize>,
 }
 
@@ -69,6 +74,11 @@ impl Default for Config {
                 r"(?i)screenshot".to_string(),
             ],
             verify_tools: vec![r"^mcp__(playwright|claude-in-chrome)".to_string()],
+            denial_patterns: vec![
+                "Permission for this action was denied".to_string(),
+                "The user doesn't want to proceed".to_string(),
+                "User rejected".to_string(),
+            ],
             min_edits: 1,
         }
     }
@@ -118,6 +128,9 @@ impl Config {
         }
         if let Some(v) = partial.verify_tools {
             self.verify_tools = v;
+        }
+        if let Some(v) = partial.denial_patterns {
+            self.denial_patterns = v;
         }
         if let Some(v) = partial.min_edits {
             self.min_edits = v;
@@ -178,6 +191,15 @@ verify_patterns = [
 # Tool names matching any of these patterns count as verification
 # (e.g. browser-automation MCP tools).
 verify_tools = ["^mcp__(playwright|claude-in-chrome)"]
+
+# Tool results matching any of these patterns are treated as if the call
+# never ran: a permission denial is not a verification outcome, so it must
+# neither pass nor fail the gate.
+denial_patterns = [
+    "Permission for this action was denied",
+    "The user doesn't want to proceed",
+    "User rejected",
+]
 
 # Minimum number of qualifying edits before the gate engages at all.
 min_edits = 1

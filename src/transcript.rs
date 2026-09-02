@@ -73,6 +73,11 @@ pub fn evaluate_reader<R: Read>(reader: BufReader<R>, config: &Config) -> Result
         "verify_tools",
         &Config::default().verify_tools,
     );
+    let denial_re = compile_pattern_set(
+        &config.denial_patterns,
+        "denial_patterns",
+        &Config::default().denial_patterns,
+    );
 
     let mut edits: Vec<EditEvent> = Vec::new();
     let mut verifies: Vec<VerifyEvent> = Vec::new();
@@ -210,8 +215,16 @@ pub fn evaluate_reader<R: Read>(reader: BufReader<R>, config: &Config) -> Result
                             .get("is_error")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
+                        let text = result_text(block.get("content"));
+                        // A permission denial means the call never ran: it is
+                        // no evidence anything was checked, in either
+                        // direction, so leave this verification unresolved
+                        // exactly like an interrupted one.
+                        if denial_re.is_match(&text) {
+                            continue;
+                        }
                         verifies[idx].is_error = is_error;
-                        verifies[idx].result_snippet = result_snippet(block.get("content"));
+                        verifies[idx].result_snippet = text.chars().take(200).collect();
                         verifies[idx].resolved = true;
                     }
                 }
@@ -258,11 +271,13 @@ fn decide(edits: Vec<EditEvent>, verifies: Vec<VerifyEvent>, config: &Config) ->
     };
 
     // Only a verification whose tool_result actually arrived counts: a
-    // tool_use with no result (interrupted, rejected, or never completed)
-    // is not evidence anything was checked.
+    // tool_use with no result (interrupted, denied, or never completed)
+    // is not evidence anything was checked. `>=` rather than `>`: one Bash
+    // call can both edit and verify (`printf > x.json && curl ...`), and the
+    // two events then share a line.
     let verifies_after: Vec<VerifyEvent> = verifies
         .iter()
-        .filter(|v| v.line > last_edit.line && v.resolved)
+        .filter(|v| v.line >= last_edit.line && v.resolved)
         .cloned()
         .collect();
 
@@ -307,12 +322,23 @@ fn decide(edits: Vec<EditEvent>, verifies: Vec<VerifyEvent>, config: &Config) ->
             decision,
         }
     } else {
-        // Block if ANY verification after the last edit failed, not just the
-        // one with the highest tool_use line: tool calls can be dispatched
-        // out of order relative to when their results come back, so "last by
-        // tool_use line" can pick a result that isn't actually the most
-        // recent thing that happened, and silently hide an earlier failure.
-        let decision = if let Some(failed) = verifies_after.iter().rev().find(|v| v.is_error) {
+        // Latest-wins: only the newest resolved verification(s) decide. The
+        // previous rule blocked on ANY failure after the last edit, which
+        // made a single benign failure unclearable: no number of later green
+        // runs could ever lift the block until the next edit reset the
+        // window. Verifications dispatched together in one assistant message
+        // share a line; that tie is resolved conservatively, so one failure
+        // among the batch still blocks.
+        let latest_line = verifies_after
+            .iter()
+            .map(|v| v.line)
+            .max()
+            .expect("verifies_after is non-empty in this branch");
+        let latest_failure = verifies_after
+            .iter()
+            .filter(|v| v.line == latest_line)
+            .find(|v| v.is_error);
+        let decision = if let Some(failed) = latest_failure {
             Decision::Block {
                 reason: format!("last verification failed: {}", failed.result_snippet),
             }
@@ -498,9 +524,22 @@ fn last_path_like_token(segment: &str) -> Option<String> {
 /// a later, unrelated segment in the same compound command must never
 /// override the real target.
 fn extract_bash_file_hint(command: &str) -> Option<String> {
+    // Track `cd <dir>` in earlier segments so a relative target written after
+    // it resolves under that directory: `cd /x/scratchpad && printf > f.json`
+    // edits /x/scratchpad/f.json, and ignore-path globs must see that.
+    let mut last_cd: Option<String> = None;
     for segment in split_command_segments(command) {
+        let mut words = segment.split_whitespace();
+        if words.next() == Some("cd") {
+            if let Some(dir) = words.next() {
+                let dir = dir.trim_matches(|c| c == '"' || c == '\'');
+                if !dir.is_empty() && !dir.starts_with('-') {
+                    last_cd = Some(dir.to_string());
+                }
+            }
+        }
         if let Some(target) = redirect_target_in_segment(segment) {
-            return Some(target);
+            return Some(join_cd(&last_cd, target));
         }
         if redirect_matches(segment).next().is_some() {
             // A redirect operator is present but every target it points at
@@ -511,11 +550,24 @@ fn extract_bash_file_hint(command: &str) -> Option<String> {
         }
         if edit_keyword_re().is_match(segment) {
             if let Some(target) = last_path_like_token(segment) {
-                return Some(target);
+                return Some(join_cd(&last_cd, target));
             }
         }
     }
     None
+}
+
+/// Resolves a relative edit target under the last `cd` directory seen in the
+/// same command, when there is one. Absolute (and `~`-prefixed) targets are
+/// left alone.
+fn join_cd(last_cd: &Option<String>, target: String) -> String {
+    if target.starts_with('/') || target.starts_with('~') {
+        return target;
+    }
+    match last_cd {
+        Some(dir) => format!("{}/{}", dir.trim_end_matches('/'), target),
+        None => target,
+    }
 }
 
 fn bash_label(command: &str) -> String {
@@ -534,8 +586,10 @@ fn all_ignored(files: &[String], globs: &[String]) -> bool {
     files.iter().all(|f| is_ignored_path(f, globs))
 }
 
-fn result_snippet(content: Option<&Value>) -> String {
-    let text = match content {
+/// Full text of a tool_result's content (truncation happens at the caller,
+/// after denial-pattern matching has seen the whole text).
+fn result_text(content: Option<&Value>) -> String {
+    match content {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(arr)) => arr
             .iter()
@@ -549,8 +603,7 @@ fn result_snippet(content: Option<&Value>) -> String {
             .join(" "),
         Some(other) => other.to_string(),
         None => String::new(),
-    };
-    text.chars().take(200).collect()
+    }
 }
 
 #[cfg(test)]
@@ -687,6 +740,184 @@ mod tests {
         // commands after it) must not override that hint.
         let cmd = "sed -e 's/a/b/' input.txt > output.txt && python3 - <<'EOF'\nsee /docs/api); note\nEOF\nrm -f input.txt; ls -la /tmp/files*";
         assert_eq!(hint_via_pipeline(cmd), Some("output.txt".to_string()));
+    }
+
+    /// One assistant record holding `tool_use` blocks (id, tool name, input).
+    fn assistant_record(uses: &[(&str, &str, Value)]) -> String {
+        let blocks: Vec<Value> = uses
+            .iter()
+            .map(|(id, name, input)| {
+                serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
+            })
+            .collect();
+        serde_json::json!({
+            "type": "assistant",
+            "isSidechain": false,
+            "message": {"role": "assistant", "content": blocks}
+        })
+        .to_string()
+    }
+
+    /// One user record holding a `tool_result` for `id`.
+    fn result_record(id: &str, is_error: bool, text: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "isSidechain": false,
+            "message": {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": id, "is_error": is_error,
+                "content": [{"type": "text", "text": text}]
+            }]}
+        })
+        .to_string()
+    }
+
+    fn evaluate_lines(lines: &[String]) -> Report {
+        let transcript = format!("{}\n", lines.join("\n"));
+        let reader = BufReader::new(std::io::Cursor::new(transcript.into_bytes()));
+        evaluate_reader(reader, &Config::default()).expect("evaluates cleanly")
+    }
+
+    fn edit_record(id: &str) -> String {
+        assistant_record(&[(
+            id,
+            "Edit",
+            serde_json::json!({"file_path": "src/x.rs", "old_string": "a", "new_string": "b"}),
+        )])
+    }
+
+    fn verify_record(id: &str) -> String {
+        assistant_record(&[(id, "Bash", serde_json::json!({"command": "cargo test"}))])
+    }
+
+    const DENIAL_TEXT: &str = "Permission for this action was denied by the Claude Code auto mode classifier. Reason: Blocked by classifier.";
+
+    #[test]
+    fn later_green_verification_clears_earlier_failure() {
+        // A failed check followed by a passing one must not keep blocking:
+        // the newest resolved verification decides.
+        let report = evaluate_lines(&[
+            edit_record("e1"),
+            result_record("e1", false, "ok"),
+            verify_record("v1"),
+            result_record("v1", true, "exit code 1"),
+            verify_record("v2"),
+            result_record("v2", false, "all green"),
+        ]);
+        assert_eq!(report.decision, Decision::Allow);
+    }
+
+    #[test]
+    fn latest_failing_verification_still_blocks() {
+        let report = evaluate_lines(&[
+            edit_record("e1"),
+            result_record("e1", false, "ok"),
+            verify_record("v1"),
+            result_record("v1", false, "all green"),
+            verify_record("v2"),
+            result_record("v2", true, "exit code 1"),
+        ]);
+        assert!(report.is_block());
+    }
+
+    #[test]
+    fn parallel_same_line_green_and_error_blocks() {
+        // Two verifications dispatched in ONE assistant message share a line;
+        // if either failed, the tie is resolved conservatively as a block.
+        let parallel = assistant_record(&[
+            ("v1", "Bash", serde_json::json!({"command": "cargo test"})),
+            ("v2", "Bash", serde_json::json!({"command": "cargo build"})),
+        ]);
+        let report = evaluate_lines(&[
+            edit_record("e1"),
+            result_record("e1", false, "ok"),
+            parallel,
+            result_record("v1", false, "all green"),
+            result_record("v2", true, "exit code 101"),
+        ]);
+        assert!(report.is_block());
+    }
+
+    #[test]
+    fn permission_denial_is_not_a_failed_verification() {
+        // A denied tool call never ran: it is no evidence either way, so the
+        // earlier green verification still stands.
+        let report = evaluate_lines(&[
+            edit_record("e1"),
+            result_record("e1", false, "ok"),
+            verify_record("v1"),
+            result_record("v1", false, "all green"),
+            verify_record("v2"),
+            result_record("v2", true, DENIAL_TEXT),
+        ]);
+        assert_eq!(report.decision, Decision::Allow);
+    }
+
+    #[test]
+    fn denied_only_verification_leaves_edit_unverified() {
+        // A denial is not a verification either: with nothing else after the
+        // edit, this is the "edited without verification" case, not a
+        // "verification failed" one.
+        let report = evaluate_lines(&[
+            edit_record("e1"),
+            result_record("e1", false, "ok"),
+            verify_record("v1"),
+            result_record("v1", true, DENIAL_TEXT),
+        ]);
+        match &report.decision {
+            Decision::Block { reason } => assert!(
+                reason.contains("Edited without verification"),
+                "wrong reason: {reason}"
+            ),
+            Decision::Allow => panic!("expected a block"),
+        }
+    }
+
+    #[test]
+    fn same_record_edit_and_verify_counts_as_verified() {
+        // `printf > file && curl ...` edits and verifies in one Bash call:
+        // the verification on the same line must count as after the edit.
+        let combined = assistant_record(&[(
+            "b1",
+            "Bash",
+            serde_json::json!({"command": "printf '%s' '{}' > data.json && curl -s -d @data.json https://api.example.com"}),
+        )]);
+        let report = evaluate_lines(&[combined.clone(), result_record("b1", false, "[]")]);
+        assert_eq!(report.decision, Decision::Allow);
+
+        let failing = evaluate_lines(&[combined, result_record("b1", true, "exit code 7")]);
+        assert!(failing.is_block());
+    }
+
+    #[test]
+    fn relative_redirect_after_cd_into_ignored_dir_is_ignored() {
+        // `cd .../scratchpad && printf > file.json` writes under an ignored
+        // path even though the redirect target is spelled relative.
+        let record = assistant_record(&[(
+            "b1",
+            "Bash",
+            serde_json::json!({"command": "cd /private/tmp/session/scratchpad && printf '%s' '{}' > sam_adv.json"}),
+        )]);
+        let report = evaluate_lines(&[record, result_record("b1", false, "")]);
+        assert_eq!(report.decision, Decision::Allow);
+        assert!(report.last_edit.is_none());
+    }
+
+    #[test]
+    fn cd_tracking_absolutizes_relative_redirect_targets() {
+        assert_eq!(
+            hint_via_pipeline("cd /a/b && printf y > f.json"),
+            Some("/a/b/f.json".to_string())
+        );
+        // Absolute targets are left alone.
+        assert_eq!(
+            hint_via_pipeline("cd /a/b && printf y > /c/f.json"),
+            Some("/c/f.json".to_string())
+        );
+        // No cd: the relative target stays relative.
+        assert_eq!(
+            hint_via_pipeline("printf y > f.json"),
+            Some("f.json".to_string())
+        );
     }
 
     #[test]
